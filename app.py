@@ -1,201 +1,197 @@
 # app.py
+# -------------------------------------------------------------
+# Calculadora de envíos (versión lista para demo)
+# - ETA (regresión lineal)
+# - Monto transacción (regresión lineal)
+# - Prob. de cumplimiento (regresión logística)
+# - Costos didácticos
+# -------------------------------------------------------------
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-import joblib
-import pickle
-from pathlib import Path
+from joblib import load
+import os
+from modelos import LinearRegressionFromScratch, LinearRegressionCostFromScratch, LogisticRegressionFromScratch
 
-# -------------------- Configuración de la página --------------------
-st.set_page_config(page_title="Calculadora Inteligente de Envíos", layout="centered")
-st.title("Calculadora Inteligente de Envíos")
-st.caption("Predice **tiempo_espera** y estima el costo del envío.")
 
-# -------------------- Carga del modelo y features --------------------
-@st.cache_resource
-def _safe_load_pickle(path: Path):
-    try:
-        return joblib.load(path)
-    except Exception:
-        with path.open("rb") as f:
-            return pickle.load(f)
+# =========================
+# Configuraciones
+# =========================
+FEATURES_NUM = ['Temperature','Humidity','Inventory_Level','Asset_Utilization','Demand_Forecast']
+CATEGORICAL_ETA = ["estado_envio", "estado_trafico", "motivo_retraso_logistico"]
+CATEGORICAL_DELAY = ["estado_trafico"]
 
-@st.cache_resource
-def load_model_and_features():
-    here = Path(__file__).resolve().parent
-
-    # 1) Artefactos recomendados: {'model','features'}
-    art_path = here / "smart_logistics_artifacts.pkl"
-    if art_path.exists():
-        art = _safe_load_pickle(art_path)
-        return art["model"], list(art["features"])
-
-    # 2) Modelo suelto + reconstrucción de features desde CSV
-    for pkl_name in ["linear_regression_model.pkl", "smart_logistics_dataset.pkl"]:
-        pkl_path = here / pkl_name
-        if pkl_path.exists():
-            modelo = _safe_load_pickle(pkl_path)
-            csv_path = here / "smart_logistics_dataset.csv"
-            if not csv_path.exists():
-                raise FileNotFoundError(
-                    "Se encontró el modelo, pero falta 'smart_logistics_artifacts.pkl' "
-                    "y el CSV para reconstruir columnas."
-                )
-            df = pd.read_csv(csv_path)
-            mapa = {
-                "Timestamp": "marca_tiempo",
-                "Asset_ID": "id_activo",
-                "Latitude": "latitud",
-                "Longitude": "longitud",
-                "Inventory_Level": "nivel_inventario",
-                "Shipment_Status": "estado_envio",
-                "Temperature": "temperatura",
-                "Humidity": "humedad",
-                "Traffic_Status": "estado_trafico",
-                "Waiting_Time": "tiempo_espera",
-                "User_Transaction_Amount": "monto_transaccion_usuario",
-                "User_Purchase_Frequency": "frecuencia_compra_usuario",
-                "Logistics_Delay_Reason": "motivo_retraso_logistico",
-                "Asset_Utilization": "utilizacion_activo",
-                "Demand_Forecast": "pronostico_demanda",
-                "Logistics_Delay": "retraso_logistico",
-            }
-            df = df.rename(columns=mapa, errors="ignore")
-            if "marca_tiempo" in df.columns:
-                df["marca_tiempo"] = pd.to_datetime(df["marca_tiempo"], errors="coerce")
-            for col in ["estado_envio", "motivo_retraso_logistico"]:
-                if col in df.columns:
-                    df = df.drop(columns=col)
-            objetivo = "tiempo_espera"
-            features = [c for c in df.columns
-                        if c != objetivo and pd.api.types.is_numeric_dtype(df[c])]
-            var0 = [c for c in features if df[c].nunique(dropna=False) <= 1]
-            features = [c for c in features if c not in var0]
-            return modelo, features
-
-    raise FileNotFoundError(
-        "No encontré archivos de modelo. Coloca 'smart_logistics_artifacts.pkl' o un .pkl de modelo junto al CSV."
-    )
-
-try:
-    modelo, FEATURES = load_model_and_features()
-    st.success("Modelo cargado correctamente.")
-except Exception as e:
-    st.error(f"No pude cargar el modelo/artefactos: {e}")
-    st.stop()
-
-# -------------------- Lógica de tarifas (fijas, según tipo) --------------------
-# Ajusta estos valores según tu política
-BASE_TARIFAS = {
-    "Regular": 1.00,       # S/ por unidad de tiempo del modelo (p.ej., horas)
-    "Prioritario": 1.50,   # S/ por unidad de tiempo del modelo
+# Mapeo de nombres (entrenamiento ↔ interfaz)
+NAME_MAP = {
+    "Temperature": "temperatura",
+    "Humidity": "humedad",
+    "Inventory_Level": "nivel_inventario",
+    "Asset_Utilization": "uso_activos",
+    "Demand_Forecast": "pronostico_demanda"
 }
-MULT_PRIORITARIO = 1.10     # <- multiplicador fijo (no editable en UI)
 
-def obtener_tarifa_base(tipo: str) -> float:
-    return float(BASE_TARIFAS.get(tipo, BASE_TARIFAS["Regular"]))
+# Fórmula de costo
+def calcular_costo(distancia_km, tipo_envio, demanda):
+    base = {"Express": 7, "Standard": 5, "Economy": 3}
+    rate = {"Express": 0.9, "Standard": 0.6, "Economy": 0.4}
+    return base[tipo_envio] + rate[tipo_envio]*distancia_km * (1 + 0.1*demanda)
 
-# -------------------- Parámetros (sin entradas editables de costo) --------------------
-st.sidebar.header("Parámetros")
-tipo_envio = st.sidebar.selectbox("Tipo de envío", ["Regular", "Prioritario"])
+# =========================
+# Carga de modelos y preprocessors
+# =========================
+MODELOS_DIR = os.path.join(os.path.dirname(__file__), "Datos Guardados")
 
-def estimar_costo(tiempo_pred: float, tipo: str) -> tuple[float, float]:
-    """
-    Devuelve (tarifa_base_aplicada, costo_estimado)
-    costo = max(0, tiempo_pred) * tarifa_base(tipo) * (1 o MULT_PRIORITARIO)
-    """
-    tarifa_base = obtener_tarifa_base(tipo)
-    tiempo = float(np.maximum(0.0, tiempo_pred))
-    factor = MULT_PRIORITARIO if tipo == "Prioritario" else 1.0
-    costo = tiempo * tarifa_base * factor
-    return tarifa_base, costo
+reg = load(os.path.join(MODELOS_DIR, "reg.joblib"))           # ETA
+reg_cost = load(os.path.join(MODELOS_DIR, "reg_cost.joblib")) # Monto
+logreg = load(os.path.join(MODELOS_DIR, "logreg.joblib"))     # Retraso
 
-# -------------------- UI de entrada (1 registro) --------------------
-def build_single_input(features):
-    with st.sidebar.form("form_prediccion", clear_on_submit=False):
-        valores = {f: st.number_input(f, value=0.0, step=0.1, format="%.4f")
-                   for f in features}
-        submitted = st.form_submit_button("Predecir")
-    X = pd.DataFrame([valores], columns=features).astype("float64")
-    return X, submitted
+scaler_eta = load(os.path.join(MODELOS_DIR, "scaler_eta.joblib"))
+encoder_eta = load(os.path.join(MODELOS_DIR, "encoder_eta.joblib"))
 
-X_new, submit = build_single_input(FEATURES)
+scaler_cost = load(os.path.join(MODELOS_DIR, "scaler_cost.joblib"))
+encoder_cost = load(os.path.join(MODELOS_DIR, "encoder_cost.joblib"))
 
-if submit:
-    try:
-        pred = float(modelo.predict(X_new)[0])
-        tarifa_base, costo = estimar_costo(pred, tipo_envio)
+preprocessor_delay = load(os.path.join(MODELOS_DIR, "preprocessor_delay.joblib"))
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Tiempo estimado", f"{pred:.2f}")
-        c2.metric("Tarifa base aplicada", f"S/ {tarifa_base:.2f}")
-        c3.metric("Costo estimado", f"S/ {costo:.2f}")
+# =========================
+# UI – Entradas
+# =========================
+st.set_page_config(page_title="Calculadora de Envíos", layout="wide")
+st.title("📦 Calculadora de Envíos — demo educativa")
+st.caption("ETA + Prob. de cumplimiento + Monto transacción + Costos")
 
-        st.write("**Entrada usada:**")
-        st.dataframe(X_new)
-        if tipo_envio == "Prioritario":
-            st.caption(f"Tipo: {tipo_envio} · Tarifa base: S/ {tarifa_base:.2f} · Multiplicador fijo: x{MULT_PRIORITARIO:.2f}")
-        else:
-            st.caption(f"Tipo: {tipo_envio} · Tarifa base: S/ {tarifa_base:.2f}")
-    except Exception as e:
-        st.error(f"No se pudo realizar la predicción: {e}")
+st.sidebar.header("⚙️ Parámetros de entrada")
 
-st.divider()
+# Numéricas
+distance_km = st.sidebar.slider("Distancia estimada (km)", 1, 200, 25)
+demanda_nivel = st.sidebar.select_slider("Nivel de demanda", options=["Baja","Media","Alta"], value="Media")
+demanda_factor = {"Baja": 0, "Media": 1, "Alta": 2}[demanda_nivel]
 
-# -------------------- Predicción por lote --------------------
-st.subheader("Predicción por lote")
-uploaded = st.file_uploader("Sube un CSV con **exactamente** estas columnas:", type="csv")
-st.code(", ".join(FEATURES), language="text")
+temp = st.sidebar.slider("Temperatura (°C)", -5, 45, 25)
+hum  = st.sidebar.slider("Humedad (%)", 10, 100, 60)
+inv  = st.sidebar.slider("Inventario (0-1000)", 0, 1000, 300)
+util = st.sidebar.slider("Uso de activos (%)", 0, 100, 70)
+dfor = st.sidebar.slider("Demanda forecast (0-1000)", 0, 1000, 250)
 
-if uploaded is not None:
-    try:
-        df_up = pd.read_csv(uploaded)
-        faltan = [c for c in FEATURES if c not in df_up.columns]
-        if faltan:
-            st.error(f"Faltan columnas en tu archivo: {faltan}")
-        else:
-            Xb = df_up[FEATURES].astype("float64")
-            yhat = modelo.predict(Xb).astype(float)
+# Categóricas
+estado_envio = st.sidebar.selectbox("Estado del envío", ["En tránsito", "Pendiente", "Entregado"])
+estado_trafico = st.sidebar.selectbox("Estado del tráfico", ["Normal", "Congestionado", "Accidente"])
+motivo_retraso = st.sidebar.selectbox("Motivo del retraso logístico", ["Ninguno", "Clima", "Demanda alta", "Otro"])
 
-            tarifa_base = obtener_tarifa_base(tipo_envio)
-            factor = MULT_PRIORITARIO if tipo_envio == "Prioritario" else 1.0
-            costo_est = np.maximum(0.0, yhat) * tarifa_base * factor
+contexto = st.sidebar.radio("Contexto", ["Económico", "Urgente"], index=0)
 
-            out = df_up.copy()
-            out["tiempo_espera_predicho"] = yhat
-            out["tarifa_base_aplicada"] = tarifa_base
-            out["costo_estimado"] = costo_est
+# =========================
+# Preparar datos para predicción
+# =========================
+X_num = pd.DataFrame([{
+    "temperatura": temp,
+    "humedad": hum,
+    "nivel_inventario": inv,
+    "utilizacion_activo": util,   # corregido
+    "pronostico_demanda": dfor,
+    "frecuencia_compra_usuario": 1  # agregado (valor dummy)
+}])
 
-            st.success("Predicción realizada.")
-            nota = f"Tipo: {tipo_envio} · Tarifa base: S/ {tarifa_base:.2f}"
-            if tipo_envio == "Prioritario":
-                nota += f" · Multiplicador fijo: x{MULT_PRIORITARIO:.2f}"
-            st.caption(f"Aplicado a todo el archivo → {nota}")
-            st.dataframe(out.head(50))
+# Renombrar columnas según lo que vio el scaler en entrenamiento
+X_num = X_num.rename(columns=NAME_MAP)
 
-            st.download_button(
-                "Descargar predicciones (CSV)",
-                data=out.to_csv(index=False).encode("utf-8"),
-                file_name="predicciones_envios.csv",
-                mime="text/csv",
-            )
-    except Exception as e:
-        st.error(f"Error leyendo o procesando el CSV: {e}")
+# ETA
+X_num_scaled = scaler_eta.transform(X_num)
+X_cat_dummy = encoder_eta.transform(pd.DataFrame([{
+    "estado_envio": estado_envio,
+    "estado_trafico": estado_trafico,
+    "motivo_retraso_logistico": motivo_retraso
+}]))
+X_all_eta = np.hstack([X_num_scaled, X_cat_dummy])
+X_all_eta = np.c_[np.ones((X_all_eta.shape[0],1)), X_all_eta]  # bias
 
-with st.expander("Detalles del modelo"):
-    try:
-        coefs = getattr(modelo[-1], "coef_", None)
-        if coefs is not None and len(coefs) == len(FEATURES):
-            st.write("Coeficientes (orden = features):")
-            st.dataframe(pd.DataFrame({"feature": FEATURES, "coef": coefs}).sort_values("coef"))
-        st.write("Pipeline:", modelo)
-    except Exception:
-        pass
+eta_min = float(reg.predict(X_all_eta)[0])
+eta_min = max(1.0, eta_min)
+eta_low, eta_high = eta_min*0.8, eta_min*1.2
 
-with st.expander("Lógica de tarifas (editable por código)"):
-    st.write("Tarifas base aplicadas por tipo de envío y multiplicador fijo para prioritario:")
-    st.dataframe(pd.DataFrame(
-        [{"tipo_envio": k, "tarifa_base": v} for k, v in BASE_TARIFAS.items()]
-    ))
-    st.write(f"Multiplicador prioritario fijo: x{MULT_PRIORITARIO:.2f}")
-    st.caption("Edita los dict/constantes BASE_TARIFAS y MULT_PRIORITARIO en el código para cambiar estos valores.")
+# Monto transacción
+X_num_cost = scaler_cost.transform(X_num)
+X_cat_cost = encoder_cost.transform(pd.DataFrame([{
+    "estado_envio": estado_envio,
+    "estado_trafico": estado_trafico,
+    "motivo_retraso_logistico": motivo_retraso
+}])).toarray()
+X_all_cost = np.hstack([X_num_cost, X_cat_cost])
+
+monto = float(reg_cost.predict(X_all_cost)[0])
+monto = max(0.0, monto)
+
+# Prob. de retraso
+X_delay = preprocessor_delay.transform(pd.DataFrame([{
+    "temperatura": temp,
+    "humedad": hum,
+    "nivel_inventario": inv,
+    "uso_activos": util,
+    "pronostico_demanda": dfor,
+    "estado_trafico": estado_trafico
+}]))
+if hasattr(X_delay, "toarray"):
+    X_delay = X_delay.toarray()
+
+prob_delay = float(logreg.predict_proba(X_delay)[0,1])
+prob_delay = min(max(prob_delay, 0.0), 1.0)
+prob_ok = 1 - prob_delay
+
+# Costos
+cost_express  = calcular_costo(distance_km, "Express",  demanda_factor)
+cost_standard = calcular_costo(distance_km, "Standard", demanda_factor)
+cost_economy  = calcular_costo(distance_km, "Economy",  demanda_factor)
+
+# =========================
+# Salida
+# =========================
+st.subheader("Resultados")
+
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    st.markdown("### ⏱️ ETA")
+    st.metric("ETA central", f"{eta_min:.1f} min")
+    st.caption(f"Rango: {eta_low:.1f}–{eta_high:.1f} min (±20%)")
+
+with c2:
+    st.markdown("### 🎯 Cumplimiento")
+    st.metric("Prob. de cumplimiento", f"{prob_ok*100:.1f}%")
+    st.progress(prob_ok)
+
+with c3:
+    st.markdown("### 💰 Monto transacción")
+    st.metric("Monto estimado", f"${monto:.2f}")
+
+with c4:
+    st.markdown("### 💸 Costos")
+    st.write(f"Express:  ${cost_express:.2f}")
+    st.write(f"Standard: ${cost_standard:.2f}")
+    st.write(f"Economy:  ${cost_economy:.2f}")
+
+# Tabla comparativa
+rows = [
+    {"Opción": "Express",  "Costo (USD)": cost_express,  "ETA (min)": eta_min*0.9, "Cumplimiento (%)": prob_ok*100*1.05},
+    {"Opción": "Standard", "Costo (USD)": cost_standard, "ETA (min)": eta_min*1.0, "Cumplimiento (%)": prob_ok*100*1.00},
+    {"Opción": "Economy",  "Costo (USD)": cost_economy,  "ETA (min)": eta_min*1.1, "Cumplimiento (%)": prob_ok*100*0.95},
+]
+tbl = pd.DataFrame(rows)
+tbl["ETA (min)"] = tbl["ETA (min)"].clip(lower=1).round(1)
+tbl["Cumplimiento (%)"] = tbl["Cumplimiento (%)"].clip(lower=5, upper=99).round(1)
+tbl["Costo (USD)"] = tbl["Costo (USD)"].round(2)
+
+if contexto == "Urgente":
+    tbl = tbl.sort_values(by=["ETA (min)", "Cumplimiento (%)"], ascending=[True, False])
+else:
+    tbl = tbl.sort_values(by=["Costo (USD)", "Cumplimiento (%)"], ascending=[True, False])
+
+st.markdown("### 🔍 Comparación de opciones")
+st.dataframe(tbl.reset_index(drop=True), use_container_width=True)
+
+with st.expander("ℹ️ ¿Cómo se calculó?"):
+    st.write("- ETA: regresión lineal sobre variables operativas.")
+    st.write("- Rango ETA: ±20% (aprox. didáctica).")
+    st.write("- Cumplimiento: 1 − prob(retraso) de la regresión logística.")
+    st.write("- Monto: regresión lineal sobre mismas variables.")
+    st.write("- Costo: base + tarifa/km × (1 + 0.1×demanda).")
+    st.write("- Orden según contexto: Urgente (menor ETA) vs Económico (menor costo).")

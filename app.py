@@ -42,7 +42,7 @@ def calcular_costo(distancia_km, tipo_envio, demanda):
 # =========================
 # Carga de modelos y preprocessors
 # =========================
-MODELOS_DIR = os.path.join(os.path.dirname(__file__), "Datos Guardados")
+MODELOS_DIR = os.path.join(os.path.dirname(__file__), "Datos guardados")
 
 reg = load(os.path.join(MODELOS_DIR, "reg.joblib"))           # ETA
 reg_cost = load(os.path.join(MODELOS_DIR, "reg_cost.joblib")) # Monto

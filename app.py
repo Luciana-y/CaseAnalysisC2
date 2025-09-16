@@ -14,11 +14,10 @@ from joblib import load
 import os
 from modelos import LinearRegressionFromScratch, LinearRegressionCostFromScratch, LogisticRegressionFromScratch
 
-
 # =========================
 # Configuraciones
 # =========================
-FEATURES_NUM = ['Temperature','Humidity','Inventory_Level','Asset_Utilization','Demand_Forecast']
+FEATURES_NUM = ['Temperature','Humidity','Inventory_Level','Asset_Utilization','Demand_Forecast','User_Purchase_Frequency']
 CATEGORICAL_ETA = ["estado_envio", "estado_trafico", "motivo_retraso_logistico"]
 CATEGORICAL_DELAY = ["estado_trafico"]
 
@@ -27,9 +26,12 @@ NAME_MAP = {
     "Temperature": "temperatura",
     "Humidity": "humedad",
     "Inventory_Level": "nivel_inventario",
-    "Asset_Utilization": "uso_activos",
-    "Demand_Forecast": "pronostico_demanda"
+    "Asset_Utilization": "utilizacion_activo",  # corregido
+    "Demand_Forecast": "pronostico_demanda",
+    "User_Purchase_Frequency": "frecuencia_compra_usuario"
 }
+# Invertido (español → inglés)
+NAME_MAP_INV = {v: k for k, v in NAME_MAP.items()}
 
 # Fórmula de costo
 def calcular_costo(distancia_km, tipo_envio, demanda):
@@ -81,22 +83,22 @@ motivo_retraso = st.sidebar.selectbox("Motivo del retraso logístico", ["Ninguno
 
 contexto = st.sidebar.radio("Contexto", ["Económico", "Urgente"], index=0)
 
-# =========================
-# Preparar datos para predicción
-# =========================
+# Obtener el orden exacto con el que fue entrenado
+FEATURES_NUM = list(scaler_eta.feature_names_in_)
+# Entrada del usuario
 X_num = pd.DataFrame([{
     "temperatura": temp,
     "humedad": hum,
     "nivel_inventario": inv,
-    "utilizacion_activo": util,   # corregido
+    "utilizacion_activo": util,
     "pronostico_demanda": dfor,
-    "frecuencia_compra_usuario": 1  # agregado (valor dummy)
+    "frecuencia_compra_usuario": 1
 }])
 
-# Renombrar columnas según lo que vio el scaler en entrenamiento
-X_num = X_num.rename(columns=NAME_MAP)
+# Reordenar con el orden original del scaler
+X_num = X_num[scaler_eta.feature_names_in_]
 
-# ETA
+# Transformar
 X_num_scaled = scaler_eta.transform(X_num)
 X_cat_dummy = encoder_eta.transform(pd.DataFrame([{
     "estado_envio": estado_envio,
@@ -127,10 +129,12 @@ X_delay = preprocessor_delay.transform(pd.DataFrame([{
     "temperatura": temp,
     "humedad": hum,
     "nivel_inventario": inv,
-    "uso_activos": util,
+    "utilizacion_activo": util,
     "pronostico_demanda": dfor,
+    "frecuencia_compra_usuario": 1,   # <--- agregado
     "estado_trafico": estado_trafico
 }]))
+
 if hasattr(X_delay, "toarray"):
     X_delay = X_delay.toarray()
 
